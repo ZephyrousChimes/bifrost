@@ -1,0 +1,12 @@
+REQUIREMENTS.md
+/reference/
+
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.*
+!.env.example
+
+.DS_Store
