@@ -1,0 +1,1093 @@
+openapi: 3.1.0
+
+info:
+  title: Bifrost API
+  version: "1.0.0"
+  summary: A Stripe-style payment service provider sandbox.
+  description: |
+    Bifrost is a simulated payment service provider. Merchants authenticate with an API key,
+    create payments, confirm them against a simulated acquirer, capture and refund them, and
+    receive webhooks. No real money and no real card data ever pass through it.
+
+    This document is the **source of truth**. The Spring Boot, Node, and Django backends all
+    conform to it, and the conformance suite is written against it — not against any one
+    implementation.
+
+    ## Money
+    Every amount is a positive integer in the **minor unit** of its currency (paise for INR),
+    and always travels next to a `currency`. Never a float, never a decimal string.
+
+    ## Idempotency
+    Every `POST` requires an `Idempotency-Key` header, **with one exception**: `POST /v1/merchants`.
+    Idempotency keys are scoped per merchant, and that endpoint is the one place no merchant exists
+    yet to scope by. Replaying a key returns the original response verbatim without re-executing.
+    Replaying a key with a *different* body is an error, not a cache hit. See `IdempotencyKey` for
+    the full contract.
+
+    ## Errors
+    Every non-2xx response uses the same envelope: a single `error` object carrying a coarse
+    `type`, a machine-readable `code`, a human `message`, and — for validation failures — the
+    offending `param`.
+  contact:
+    name: Bifrost
+    url: https://github.com/ZephyrousChimes/bifrost-java
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+  - url: https://api.bifrost.example.com
+    description: Hosted sandbox
+
+security:
+  - secretKey: []
+
+tags:
+  - name: Merchant
+    description: |
+      Registration is the one unauthenticated call in the API — there is no key yet to send.
+      Everything else under this tag is "your own account": there is no `{id}` and no way to
+      look up another merchant, because the API key you send already says who you are.
+  - name: Payments
+    description: |
+      The payment is the merchant's **intent** to collect money. It carries the amount, the
+      currency, and the status, and it lives across the whole checkout. Each *attempt* to move
+      the money is a separate charge, so a declined card followed by a successful retry is one
+      payment with two charges — the decline is never overwritten.
+  - name: Refunds
+    description: Refunds return captured money to the customer. They are appended, never mutations.
+  - name: Balance
+    description: What the platform owes this merchant, split into pending and available.
+  - name: Events
+    description: The record of everything that happened, and the payload delivered to webhooks.
+
+paths:
+
+  # ------------------------------------------------------------------ merchant
+
+  /v1/merchants:
+    post:
+      tags: [Merchant]
+      summary: Register a merchant
+      operationId: createMerchant
+      security: []
+      description: |
+        Creates a merchant account and mints its first secret key. This is the only endpoint in
+        the API that does not require an `Authorization` header — there is no key yet to send —
+        and correspondingly the only `POST` that does **not** accept `Idempotency-Key`: keys are
+        scoped per merchant, and no merchant exists yet to scope by. A duplicate submission
+        creates a second merchant; the caller is responsible for not double-submitting the form.
+
+        `secret_key` on the response is the only time the plaintext key is ever shown. Bifrost
+        stores only its hash — see `ApiKeyWithSecret` — so losing it means rotating, not recovering.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateMerchantRequest' }
+            examples:
+              signup:
+                value: { name: "Kolkata Kettle Co", email: "payments@kolkatakettle.example" }
+      responses:
+        '201':
+          description: |
+            Merchant created. Store `secret_key` now — it is not retrievable again, and
+            `GET /v1/merchant/api_keys` will only ever show the `prefix`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MerchantRegistration' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '409': { $ref: '#/components/responses/MerchantAlreadyExists' }
+
+  /v1/merchant:
+    get:
+      tags: [Merchant]
+      summary: Retrieve your own merchant account
+      operationId: getMerchant
+      description: |
+        There is deliberately no `{id}` here and no way to fetch a *different* merchant — the
+        account returned is always the one the API key on the request belongs to.
+      responses:
+        '200':
+          description: Your merchant account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Merchant' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/merchant/api_keys:
+    post:
+      tags: [Merchant]
+      summary: Create an additional API key
+      operationId: createApiKey
+      description: |
+        Mints a new key on your own account — for rotation, or for separating test and live
+        traffic. `secret_key` on the response is shown once, the same rule as at registration.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateApiKeyRequest' }
+      responses:
+        '201':
+          description: Key created.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyWithSecret' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '422': { $ref: '#/components/responses/IdempotencyParamsMismatch' }
+
+    get:
+      tags: [Merchant]
+      summary: List your API keys
+      operationId: listApiKeys
+      description: Never includes `secret_key` — only the `prefix`, which is why it exists.
+      responses:
+        '200':
+          description: Your keys, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/ApiKey' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/merchant/api_keys/{id}/revoke:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ApiKeyId' }
+    post:
+      tags: [Merchant]
+      summary: Revoke an API key
+      operationId: revokeApiKey
+      description: |
+        Immediate and permanent. The whole reason Bifrost uses opaque keys over something
+        self-verifying like a JWT is that compromise has to be fixable in the next request, not
+        after an expiry window — this is that mechanism. Revoking your only remaining key is
+        allowed; it is your account to lock yourself out of.
+      responses:
+        '200':
+          description: Revoked.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKey' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------ payments
+
+  /v1/payments:
+    post:
+      tags: [Payments]
+      summary: Create a payment
+      operationId: createPayment
+      description: |
+        Creates a payment in `requires_confirmation`. No money moves and no ledger entries are
+        written yet — this only records the intent.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreatePaymentRequest' }
+            examples:
+              manualCapture:
+                summary: ₹500 authorize now, capture later
+                value:
+                  amount: 50000
+                  currency: INR
+                  capture_method: manual
+                  description: Order #1042
+                  metadata: { order_id: "1042" }
+      responses:
+        '201':
+          description: Payment created.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '422': { $ref: '#/components/responses/IdempotencyParamsMismatch' }
+
+    get:
+      tags: [Payments]
+      summary: List payments
+      operationId: listPayments
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/StartingAfter'
+        - $ref: '#/components/parameters/EndingBefore'
+        - name: status
+          in: query
+          description: Filter to a single status.
+          schema: { $ref: '#/components/schemas/PaymentStatus' }
+      responses:
+        '200':
+          description: A page of payments, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/payments/{id}:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    get:
+      tags: [Payments]
+      summary: Retrieve a payment
+      operationId: getPayment
+      responses:
+        '200':
+          description: The payment, with every charge attempted against it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /v1/payments/{id}/confirm:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [Payments]
+      summary: Confirm a payment
+      operationId: confirmPayment
+      description: |
+        Submits the payment to the simulated acquirer for authorization. This creates a charge.
+
+        The outcome is chosen by the test `payment_method` token — this is how failures are
+        injected. On approval the payment becomes `requires_capture` (when
+        `capture_method: manual`) or, with automatic capture, is captured in the same step and
+        becomes `succeeded`. On decline the charge is recorded as failed and the payment
+        returns to `requires_confirmation` so another card can be tried.
+
+        Legal only from `requires_confirmation`.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConfirmPaymentRequest' }
+      responses:
+        '200':
+          description: |
+            The acquirer responded. Inspect `status` and `latest_charge` — a declined card is a
+            `200` with a failed charge, not an HTTP error, because the request itself succeeded.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+        '422': { $ref: '#/components/responses/IdempotencyParamsMismatch' }
+
+  /v1/payments/{id}/capture:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [Payments]
+      summary: Capture an authorized payment
+      operationId: capturePayment
+      description: |
+        Captures a previously authorized payment, moving it to `succeeded`. This is the point at
+        which the ledger is written: the capture transaction debits `acquirer_receivable` and
+        credits `merchant_payable_pending` plus `platform_fee_revenue`, balanced, in the same
+        database transaction as the status change.
+
+        Capturing less than the authorized amount releases the remainder. Legal only from
+        `requires_capture`; an uncaptured authorization expires on its own after seven days.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CapturePaymentRequest' }
+      responses:
+        '200':
+          description: Payment captured.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+        '422': { $ref: '#/components/responses/IdempotencyParamsMismatch' }
+
+  /v1/payments/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/PaymentId'
+    post:
+      tags: [Payments]
+      summary: Cancel a payment
+      operationId: cancelPayment
+      description: |
+        Cancels a payment that has not been captured, releasing any authorization hold.
+        `canceled` is terminal. Legal from `requires_confirmation` and `requires_capture`; a
+        `succeeded` payment must be refunded instead.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                cancellation_reason:
+                  type: string
+                  enum: [duplicate, fraudulent, requested_by_customer, abandoned]
+      responses:
+        '200':
+          description: Payment canceled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/IllegalTransition' }
+
+  # ------------------------------------------------------------------- refunds
+
+  /v1/refunds:
+    post:
+      tags: [Refunds]
+      summary: Create a refund
+      operationId: createRefund
+      description: |
+        Refunds a captured payment, fully or partially. In the ledger this is an **appended
+        reversal** carrying `reverses_transaction_id` — the original entries are never touched.
+
+        The platform fee is retained by default, matching real PSP behaviour. This means a
+        merchant who has already been paid out can end up with a negative available balance;
+        that is a real condition, not an error.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateRefundRequest' }
+            examples:
+              partial:
+                summary: Refund ₹200 of a ₹500 payment
+                value: { payment: pay_3KfQ2mLxA9vB7nR1, amount: 20000, reason: requested_by_customer }
+      responses:
+        '201':
+          description: Refund created.
+          headers:
+            Idempotent-Replay: { $ref: '#/components/headers/IdempotentReplay' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/IdempotencyConflict' }
+        '422': { $ref: '#/components/responses/IdempotencyParamsMismatch' }
+
+    get:
+      tags: [Refunds]
+      summary: List refunds
+      operationId: listRefunds
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/StartingAfter'
+        - $ref: '#/components/parameters/EndingBefore'
+        - name: payment
+          in: query
+          description: Only refunds against this payment.
+          schema: { $ref: '#/components/schemas/PaymentId' }
+      responses:
+        '200':
+          description: A page of refunds, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Refund' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/refunds/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/RefundId' }
+    get:
+      tags: [Refunds]
+      summary: Retrieve a refund
+      operationId: getRefund
+      responses:
+        '200':
+          description: The refund.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ------------------------------------------------------------------- balance
+
+  /v1/balance:
+    get:
+      tags: [Balance]
+      summary: Retrieve balance
+      operationId: getBalance
+      description: |
+        The merchant's balance, computed from the ledger rather than stored on a row.
+
+        `pending` is money captured but not yet matured; `available` is withdrawable now. They
+        are two distinct ledger accounts, so the maturity sweep between them is an auditable
+        balanced transaction rather than an invisible `UPDATE`.
+
+        Both fields are **arrays keyed by currency** even though v1 only issues INR — this is
+        the shape that lets multi-currency arrive without a breaking change.
+      responses:
+        '200':
+          description: The current balance.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Balance' }
+              examples:
+                afterCapture:
+                  summary: ₹490 captured, still maturing
+                  value:
+                    object: balance
+                    pending:  [{ amount: 49000, currency: INR }]
+                    available: [{ amount: 0, currency: INR }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  # -------------------------------------------------------------------- events
+
+  /v1/events:
+    get:
+      tags: [Events]
+      summary: List events
+      operationId: listEvents
+      description: |
+        Every event Bifrost has emitted for this merchant. Events are written to the outbox in
+        the same transaction as the change they describe, so this list can never disagree with
+        the objects it reports on.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/StartingAfter'
+        - $ref: '#/components/parameters/EndingBefore'
+        - name: type
+          in: query
+          description: Filter to a single event type.
+          schema: { $ref: '#/components/schemas/EventType' }
+      responses:
+        '200':
+          description: A page of events, newest first.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/ListResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Event' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /v1/events/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/EventId' }
+    get:
+      tags: [Events]
+      summary: Retrieve an event
+      operationId: getEvent
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+# --------------------------------------------------------------------- webhooks
+
+webhooks:
+  event:
+    post:
+      summary: Event delivered to a registered webhook endpoint
+      operationId: receiveEvent
+      description: |
+        Bifrost POSTs each event to the merchant's registered endpoints. The body is an `Event`.
+
+        Delivery is at-least-once and unordered — **receivers must be idempotent**, keyed on
+        `event.id`. A non-2xx or a timeout is retried with exponential backoff.
+
+        `Bifrost-Signature` carries a timestamp and an HMAC-SHA256 of `{timestamp}.{body}` under
+        the endpoint's secret. Verify it before trusting the payload, and reject timestamps
+        outside a five-minute window to blunt replay.
+      security: []
+      parameters:
+        - name: Bifrost-Signature
+          in: header
+          required: true
+          schema: { type: string }
+          example: t=1735689600,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Event' }
+      responses:
+        '200':
+          description: Acknowledged. Any 2xx stops retries; anything else schedules another attempt.
+
+# ------------------------------------------------------------------- components
+
+components:
+
+  securitySchemes:
+    secretKey:
+      type: http
+      scheme: bearer
+      description: |
+        The merchant's secret API key, sent as `Authorization: Bearer sk_test_...`.
+        Only the key's hash is stored, never the key itself.
+
+  headers:
+    IdempotentReplay:
+      description: Present and `true` when this response was replayed from a stored idempotency record rather than executed.
+      schema: { type: boolean }
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A client-generated unique string, at most 255 characters — a UUID is the obvious choice.
+        Scoped per merchant. Keys are retained roughly 72 hours, then reaped.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+      example: 3f2504e0-4f89-11d3-9a0c-0305e82c3301
+
+    PaymentId:
+      name: id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/PaymentId' }
+
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+
+    StartingAfter:
+      name: starting_after
+      in: query
+      description: Cursor — return the page after this object id.
+      schema: { type: string }
+
+    EndingBefore:
+      name: ending_before
+      in: query
+      description: Cursor — return the page before this object id.
+      schema: { type: string }
+
+  responses:
+    InvalidRequest:
+      description: The request body failed validation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: invalid_request_error
+              code: parameter_invalid_integer
+              message: "amount must be a positive integer in the smallest currency unit."
+              param: amount
+
+    Unauthorized:
+      description: Missing, malformed, revoked, or unknown API key.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: authentication_error
+              code: api_key_invalid
+              message: "No such API key."
+
+    NotFound:
+      description: No such object, or it belongs to another merchant. These are deliberately indistinguishable.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: invalid_request_error
+              code: resource_missing
+              message: "No such payment: pay_3KfQ2mLxA9vB7nR1"
+              param: id
+
+    IllegalTransition:
+      description: The object's current status does not permit this operation.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: invalid_request_error
+              code: payment_unexpected_state
+              message: "This payment has status 'succeeded' and cannot be captured."
+
+    IdempotencyConflict:
+      description: |
+        Another request with this idempotency key is still in flight. Retry after it settles —
+        this is the lock doing its job, not a failure.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: idempotency_error
+              code: idempotency_key_in_use
+              message: "A request with this Idempotency-Key is currently in progress."
+
+    IdempotencyParamsMismatch:
+      description: |
+        This idempotency key was already used with a different request body. Returning the
+        original response here would silently hand back someone else's object, so it is an error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: idempotency_error
+              code: idempotency_key_reused
+              message: "This Idempotency-Key was previously used with different request parameters."
+
+    MerchantAlreadyExists:
+      description: A merchant is already registered with this email.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example:
+            error:
+              type: invalid_request_error
+              code: email_already_registered
+              message: "A merchant is already registered with this email."
+              param: email
+
+  schemas:
+
+    # ---- identifiers -------------------------------------------------------
+
+    MerchantId: { type: string, pattern: '^mer_[A-Za-z0-9]{16,}$', examples: [mer_9KpN4mLxA2vC8nR6] }
+    ApiKeyId:   { type: string, pattern: '^key_[A-Za-z0-9]{16,}$', examples: [key_2Xy8dQmR4pV9kL3n] }
+    PaymentId: { type: string, pattern: '^pay_[A-Za-z0-9]{16,}$', examples: [pay_3KfQ2mLxA9vB7nR1] }
+    ChargeId:  { type: string, pattern: '^ch_[A-Za-z0-9]{16,}$',  examples: [ch_1Nx8pQLkJ4vC2mZ0] }
+    RefundId:  { type: string, pattern: '^re_[A-Za-z0-9]{16,}$',  examples: [re_7Yb2wKpM8nQ4tX6a] }
+    EventId:   { type: string, pattern: '^evt_[A-Za-z0-9]{16,}$', examples: [evt_5Hn9dTxR2kL8vB3c] }
+
+    # ---- money -------------------------------------------------------------
+
+    Amount:
+      type: integer
+      format: int64
+      minimum: 1
+      description: A positive integer in the smallest unit of the currency — 50000 is ₹500.00.
+      examples: [50000]
+
+    Currency:
+      type: string
+      enum: [INR]
+      description: |
+        ISO 4217, lowercase-insensitive but canonically uppercase. v1 issues INR only; the field
+        exists on every amount so that widening this enum is additive rather than a migration.
+      examples: [INR]
+
+    Money:
+      type: object
+      required: [amount, currency]
+      properties:
+        amount: { $ref: '#/components/schemas/Amount' }
+        currency: { $ref: '#/components/schemas/Currency' }
+
+    # ---- enums -------------------------------------------------------------
+
+    PaymentStatus:
+      type: string
+      description: |
+        The v1 subset of Stripe's PaymentIntent statuses. `succeeded` and `canceled` are terminal.
+        `requires_payment_method` and `requires_action` are deliberately omitted — the first
+        collapses into `requires_confirmation` in a sandbox with no stored payment methods, and
+        the second only exists for 3DS, which v1 does not implement.
+
+        There is no payment-level `failed`. A declined charge returns the payment to
+        `requires_confirmation` so another card can be tried — only a `Charge` fails, never the
+        `Payment` itself.
+      enum:
+        - requires_confirmation
+        - processing
+        - requires_capture
+        - succeeded
+        - canceled
+
+    CaptureMethod:
+      type: string
+      description: |
+        `automatic` captures as soon as authorization succeeds. `manual` authorizes only, holding
+        the funds until an explicit capture — the hotel-hold pattern, and the reason
+        `requires_capture` exists.
+      enum: [automatic, manual]
+      default: automatic
+
+    ChargeStatus:
+      type: string
+      enum: [pending, succeeded, failed]
+
+    RefundStatus:
+      type: string
+      enum: [pending, succeeded, failed]
+
+    EventType:
+      type: string
+      enum:
+        - payment.created
+        - payment.requires_capture
+        - payment.succeeded
+        - payment.failed
+        - payment.canceled
+        - refund.succeeded
+        - refund.failed
+        - payout.paid
+
+    Metadata:
+      type: object
+      description: Up to 20 arbitrary key-value pairs for the merchant's own bookkeeping. Never interpreted by Bifrost.
+      maxProperties: 20
+      additionalProperties: { type: string, maxLength: 500 }
+
+    # ---- objects -----------------------------------------------------------
+
+    Merchant:
+      type: object
+      required: [id, object, name, email, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/MerchantId' }
+        object: { type: string, const: merchant }
+        name: { type: string, maxLength: 200 }
+        email: { type: string, format: email }
+        created_at: { type: string, format: date-time }
+
+    ApiKey:
+      type: object
+      description: |
+        Never carries the secret itself — only `prefix`, which exists precisely so a dashboard
+        can show "sk_test_a1b2…" for identification without being able to reconstruct the key.
+      required: [id, object, prefix, livemode, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/ApiKeyId' }
+        object: { type: string, const: api_key }
+        prefix: { type: string, examples: [sk_test_a1b2c3d4] }
+        livemode: { type: boolean, default: false }
+        created_at: { type: string, format: date-time }
+        revoked_at:
+          oneOf: [{ type: string, format: date-time }, { type: "null" }]
+
+    ApiKeyWithSecret:
+      description: |
+        Returned only from the two calls that mint a key. `secret_key` appears here and nowhere
+        else, ever — not on `GET`, not on list. If it's lost, revoke it and create another.
+      allOf:
+        - $ref: '#/components/schemas/ApiKey'
+        - type: object
+          required: [secret_key]
+          properties:
+            secret_key:
+              type: string
+              examples: [sk_test_51H8x2KmQ7fLp3vNzR9wA6bC4dE1fG]
+
+    MerchantRegistration:
+      type: object
+      required: [merchant, api_key]
+      properties:
+        merchant: { $ref: '#/components/schemas/Merchant' }
+        api_key: { $ref: '#/components/schemas/ApiKeyWithSecret' }
+
+    Payment:
+      type: object
+      required: [id, object, amount, currency, status, capture_method, created_at, charges]
+      properties:
+        id: { $ref: '#/components/schemas/PaymentId' }
+        object: { type: string, const: payment }
+        amount: { $ref: '#/components/schemas/Amount' }
+        amount_captured:
+          allOf: [{ $ref: '#/components/schemas/Amount' }]
+          description: How much has actually been captured. Zero until capture.
+          minimum: 0
+        amount_refunded:
+          allOf: [{ $ref: '#/components/schemas/Amount' }]
+          description: Total refunded so far across all refunds.
+          minimum: 0
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        capture_method: { $ref: '#/components/schemas/CaptureMethod' }
+        latest_charge:
+          description: The most recent attempt, or null before the first confirm.
+          oneOf:
+            - { $ref: '#/components/schemas/ChargeId' }
+            - { type: "null" }
+        charges:
+          type: array
+          description: |
+            Every attempt made against this payment, oldest first. A declined card followed by a
+            successful retry appears here as two charges — the failure is preserved, not overwritten.
+          items: { $ref: '#/components/schemas/Charge' }
+        description:
+          oneOf: [{ type: string, maxLength: 1000 }, { type: "null" }]
+        metadata: { $ref: '#/components/schemas/Metadata' }
+        cancellation_reason:
+          oneOf:
+            - { type: string, enum: [duplicate, fraudulent, requested_by_customer, abandoned, expired] }
+            - { type: "null" }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Charge:
+      type: object
+      description: One attempt to move money. Immutable once settled.
+      required: [id, object, payment, amount, currency, status, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/ChargeId' }
+        object: { type: string, const: charge }
+        payment: { $ref: '#/components/schemas/PaymentId' }
+        amount: { $ref: '#/components/schemas/Amount' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { $ref: '#/components/schemas/ChargeStatus' }
+        acquirer_reference:
+          description: The simulated acquirer's own id for this attempt. Null while pending.
+          oneOf: [{ type: string }, { type: "null" }]
+        failure_code:
+          oneOf:
+            - { type: string, enum: [card_declined, insufficient_funds, expired_card, incorrect_cvc, processing_error, acquirer_timeout] }
+            - { type: "null" }
+        failure_message:
+          oneOf: [{ type: string }, { type: "null" }]
+        created_at: { type: string, format: date-time }
+
+    Refund:
+      type: object
+      required: [id, object, payment, amount, currency, status, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/RefundId' }
+        object: { type: string, const: refund }
+        payment: { $ref: '#/components/schemas/PaymentId' }
+        amount: { $ref: '#/components/schemas/Amount' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        status: { $ref: '#/components/schemas/RefundStatus' }
+        reason:
+          oneOf:
+            - { type: string, enum: [duplicate, fraudulent, requested_by_customer] }
+            - { type: "null" }
+        failure_reason:
+          oneOf: [{ type: string }, { type: "null" }]
+        created_at: { type: string, format: date-time }
+
+    Balance:
+      type: object
+      required: [object, pending, available]
+      properties:
+        object: { type: string, const: balance }
+        pending:
+          type: array
+          description: Captured but not yet matured. One entry per currency held.
+          items: { $ref: '#/components/schemas/Money' }
+        available:
+          type: array
+          description: |
+            Withdrawable now. May be negative when refunds exceed the balance after a payout —
+            a real condition, not an error.
+          items:
+            type: object
+            required: [amount, currency]
+            properties:
+              amount: { type: integer, format: int64 }
+              currency: { $ref: '#/components/schemas/Currency' }
+
+    Event:
+      type: object
+      required: [id, object, type, created_at, data]
+      properties:
+        id: { $ref: '#/components/schemas/EventId' }
+        object: { type: string, const: event }
+        type: { $ref: '#/components/schemas/EventType' }
+        created_at: { type: string, format: date-time }
+        data:
+          type: object
+          required: [object]
+          properties:
+            object:
+              description: The affected object, as it stood when the event fired.
+              oneOf:
+                - { $ref: '#/components/schemas/Payment' }
+                - { $ref: '#/components/schemas/Refund' }
+
+    ListResponse:
+      type: object
+      required: [object, data, has_more]
+      properties:
+        object: { type: string, const: list }
+        data: { type: array, items: {} }
+        has_more:
+          type: boolean
+          description: Whether more objects exist past this page.
+        url: { type: string }
+
+    # ---- errors ------------------------------------------------------------
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [type, message]
+          properties:
+            type:
+              type: string
+              description: |
+                The coarse class of failure. `card_error` is the customer's problem, `invalid_request_error`
+                is the merchant's, `api_error` is ours.
+              enum:
+                - api_error
+                - card_error
+                - invalid_request_error
+                - authentication_error
+                - idempotency_error
+                - rate_limit_error
+            code:
+              type: string
+              description: A stable, machine-readable code. Clients branch on this, never on `message`.
+            message:
+              type: string
+              description: Human-readable and safe to surface. Never contains card data or internal detail.
+            param:
+              type: string
+              description: The request field at fault, for validation failures.
+            request_id:
+              type: string
+              description: Echoed for support. Log it.
+
+    # ---- requests ----------------------------------------------------------
+
+    CreateMerchantRequest:
+      type: object
+      required: [name, email]
+      additionalProperties: false
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        email: { type: string, format: email }
+
+    CreateApiKeyRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        livemode:
+          type: boolean
+          default: false
+          description: Mint a live-mode key instead of a test-mode one.
+
+    CreatePaymentRequest:
+      type: object
+      required: [amount, currency]
+      additionalProperties: false
+      properties:
+        amount: { $ref: '#/components/schemas/Amount' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        capture_method: { $ref: '#/components/schemas/CaptureMethod' }
+        description: { type: string, maxLength: 1000 }
+        metadata: { $ref: '#/components/schemas/Metadata' }
+
+    ConfirmPaymentRequest:
+      type: object
+      required: [payment_method]
+      additionalProperties: false
+      properties:
+        payment_method:
+          type: string
+          description: |
+            A test payment-method token. The token *is* the test fixture — it determines what the
+            simulated acquirer does, which is how failure injection works without any real card data.
+          enum:
+            - pm_card_visa
+            - pm_card_mastercard
+            - pm_card_declined
+            - pm_card_insufficient_funds
+            - pm_card_expired
+            - pm_card_incorrect_cvc
+            - pm_card_processing_error
+            - pm_card_acquirer_timeout
+          examples: [pm_card_visa]
+
+    CapturePaymentRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        amount_to_capture:
+          allOf: [{ $ref: '#/components/schemas/Amount' }]
+          description: |
+            Defaults to the full authorized amount. Capturing less releases the remainder — the
+            authorization cannot be topped up afterwards.
+
+    CreateRefundRequest:
+      type: object
+      required: [payment]
+      additionalProperties: false
+      properties:
+        payment: { $ref: '#/components/schemas/PaymentId' }
+        amount:
+          allOf: [{ $ref: '#/components/schemas/Amount' }]
+          description: Defaults to the full un-refunded remainder.
+        reason:
+          type: string
+          enum: [duplicate, fraudulent, requested_by_customer]
