@@ -1,1 +1,0 @@
--- Bifrost baseline. Schema starts at V2
