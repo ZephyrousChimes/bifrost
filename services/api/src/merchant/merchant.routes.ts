@@ -1,6 +1,6 @@
 import { RequestHandler, Router } from "express";
 import { MerchantService } from "./merchant.service";
-import { CreateApiKeySchema, CreateMerchantSchema, UpdateMerchantSchema } from "./merchant.schema";
+import { CreateApiKeySchema, CreateMerchantSchema } from "./merchant.schema";
 import { toApiKeyView, toMerchantView } from "./merchant.view";
 
 export function createMerchantRoutes(merchantService: MerchantService, idempotent: RequestHandler): Router {
@@ -8,7 +8,7 @@ export function createMerchantRoutes(merchantService: MerchantService, idempoten
 
   router.post("/merchants", async (req, res) => {
     const input = CreateMerchantSchema.parse(req.body);
-    const registration = await merchantService.register(input.name, input.email);
+    const registration = await merchantService.register(input.name, input.email, input.webhook_url ?? null);
     res.status(201).json({
       merchant: toMerchantView(registration.merchant),
       api_key: toApiKeyView(registration.apiKey, registration.secretKey),
@@ -17,11 +17,6 @@ export function createMerchantRoutes(merchantService: MerchantService, idempoten
 
   router.get("/merchant", async (req, res) => {
     res.json(toMerchantView(await merchantService.get(req.merchantId!)));
-  });
-
-  router.patch("/merchant", async (req, res) => {
-    const input = UpdateMerchantSchema.parse(req.body);
-    res.json(toMerchantView(await merchantService.setWebhook(req.merchantId!, input.webhook_url)));
   });
 
   router.post("/merchant/api_keys", idempotent, async (req, res) => {

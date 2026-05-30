@@ -19,11 +19,10 @@ export interface Registration {
 }
 
 export interface MerchantService {
-  register(name: string, email: string): Promise<Registration>;
+  register(name: string, email: string, webhookUrl: string | null): Promise<Registration>;
   mintApiKey(merchantId: number, livemode: boolean): Promise<MintedKey>;
   revokeApiKey(merchantId: number, keyPublicId: string): Promise<ApiKeyRow>;
   get(merchantId: number): Promise<MerchantRow>;
-  setWebhook(merchantId: number, url: string | null): Promise<MerchantRow>;
 }
 
 export function createMerchantService(
@@ -45,9 +44,9 @@ export function createMerchantService(
   }
 
   return {
-    async register(name, email) {
+    async register(name, email, webhookUrl) {
       return withTransaction(pool, async (client) => {
-        const merchant = await merchantRepository.insert(generatePublicId("mer_"), name, email, client);
+        const merchant = await merchantRepository.insert(generatePublicId("mer_"), name, email, webhookUrl, client);
         const minted = await mintApiKey(merchant.id, false, client);
         return { merchant, apiKey: minted.apiKey, secretKey: minted.secretKey };
       });
@@ -69,10 +68,6 @@ export function createMerchantService(
         throw new ResourceNotFoundError("No such merchant");
       }
       return merchant;
-    },
-
-    setWebhook(merchantId, url) {
-      return merchantRepository.setWebhook(merchantId, url);
     },
   };
 }

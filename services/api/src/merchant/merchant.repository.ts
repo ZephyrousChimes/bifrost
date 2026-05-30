@@ -10,17 +10,16 @@ export interface MerchantRow {
 }
 
 export interface MerchantRepository {
-  insert(publicId: string, name: string, email: string, executor?: Queryable): Promise<MerchantRow>;
+  insert(publicId: string, name: string, email: string, webhookUrl: string | null, executor?: Queryable): Promise<MerchantRow>;
   findById(id: number): Promise<MerchantRow | null>;
-  setWebhook(id: number, url: string | null): Promise<MerchantRow>;
 }
 
 export function createMerchantRepository(pool: Queryable): MerchantRepository {
   return {
-    async insert(publicId, name, email, executor = pool) {
+    async insert(publicId, name, email, webhookUrl, executor = pool) {
       const result = await executor.query<MerchantRow>(
-        `INSERT INTO merchants (public_id, name, email) VALUES ($1, $2, $3) RETURNING *`,
-        [publicId, name, email],
+        `INSERT INTO merchants (public_id, name, email, webhook_url) VALUES ($1, $2, $3, $4) RETURNING *`,
+        [publicId, name, email, webhookUrl],
       );
       return result.rows[0];
     },
@@ -28,14 +27,6 @@ export function createMerchantRepository(pool: Queryable): MerchantRepository {
     async findById(id) {
       const result = await pool.query<MerchantRow>(`SELECT * FROM merchants WHERE id = $1`, [id]);
       return result.rows[0] ?? null;
-    },
-
-    async setWebhook(id, url) {
-      const result = await pool.query<MerchantRow>(
-        `UPDATE merchants SET webhook_url = $2 WHERE id = $1 RETURNING *`,
-        [id, url],
-      );
-      return result.rows[0];
     },
   };
 }
