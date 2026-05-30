@@ -6,33 +6,18 @@ import { IllegalTransitionError, InvalidRequestError, ResourceNotFoundError } fr
 import { recordCapture } from "../ledger/ledger.service";
 import { OutboxRepository } from "../outbox/outbox.repository";
 import { authorize, AcquirerResult } from "./acquirer.client";
-import { ChargeRepository, ChargeRow } from "./charge.repository";
 import { PaymentRepository, PaymentRow } from "./payment.repository";
-import { CancelPaymentInput, ConfirmPaymentInput, CreatePaymentInput } from "./payment.schema";
+import { ConfirmPaymentInput, CreatePaymentInput } from "./payment.schema";
 import { toPaymentView } from "./payment.view";
 
-export interface PaymentWithCharges {
-  payment: PaymentRow;
-  charges: ChargeRow[];
-}
-
 export interface PaymentService {
-  create(merchantId: number, input: CreatePaymentInput): Promise<PaymentWithCharges>;
-  get(merchantId: number, publicId: string): Promise<PaymentWithCharges>;
-  confirm(merchantId: number, publicId: string, input: ConfirmPaymentInput): Promise<PaymentWithCharges>;
-  cancel(merchantId: number, publicId: string, input: CancelPaymentInput): Promise<PaymentWithCharges>;
+  create(merchantId: number, input: CreatePaymentInput): Promise<PaymentRow>;
+  get(merchantId: number, publicId: string): Promise<PaymentRow>;
+  confirm(merchantId: number, publicId: string, input: ConfirmPaymentInput): Promise<PaymentRow>;
+  cancel(merchantId: number, publicId: string): Promise<PaymentRow>;
 }
 
-export function createPaymentService(
-  pool: Pool,
-  paymentRepository: PaymentRepository,
-  chargeRepository: ChargeRepository,
-  outboxRepository: OutboxRepository,
-): PaymentService {
-  async function loadWithCharges(payment: PaymentRow, executor: Queryable): Promise<PaymentWithCharges> {
-    return { payment, charges: await chargeRepository.listByPaymentId(payment.id, executor) };
-  }
-
+export function createPaymentService(pool: Pool, paymentRepository: PaymentRepository, outboxRepository: OutboxRepository): PaymentService {
   async function lockOrThrow(merchantId: number, publicId: string, client: Queryable): Promise<PaymentRow> {
     const payment = await paymentRepository.lockByPublicIdAndMerchantId(publicId, merchantId, client);
     if (!payment) throw new ResourceNotFoundError(`No such payment: ${publicId}`);
@@ -58,69 +43,44 @@ export function createPaymentService(
           },
           client,
         );
-        await outboxRepository.append(merchantId, "payment.created", toPaymentView(payment, []), client);
-        return { payment, charges: [] };
+        await outboxRepository.append(merchantId, "payment.created", toPaymentView(payment), client);
+        return payment;
       });
     },
 
     async get(merchantId, publicId) {
       const payment = await paymentRepository.findByPublicIdAndMerchantId(publicId, merchantId);
       if (!payment) throw new ResourceNotFoundError(`No such payment: ${publicId}`);
-      return loadWithCharges(payment, pool);
+      return payment;
     },
 
     async confirm(merchantId, publicId, input) {
-      const attempt = await withTransaction(pool, async (client) => {
+      const { payment: attempt, resumed } = await withTransaction(pool, async (client) => {
         const payment = await lockOrThrow(merchantId, publicId, client);
 
         if (payment.status === "processing") {
-          const pending = await chargeRepository.findPendingByPaymentId(payment.id, client);
-          if (!pending) throw new IllegalTransitionError("[PAYMENT] processing but no pending charge, can't resume");
-          return { payment, charge: pending, resumed: true };
+          return { payment, resumed: true };
         }
         if (payment.status !== "requires_confirmation") {
           throw new IllegalTransitionError(`[PAYMENT] is ${payment.status}, can't confirm`);
         }
 
-        const charge = await chargeRepository.insertPending(
-          {
-            publicId: generatePublicId("ch_"),
-            paymentId: payment.id,
-            amount: payment.amount,
-            currency: payment.currency,
-            paymentMethod: input.payment_method,
-          },
-          client,
-        );
-        const processing = await paymentRepository.applyProcessing(payment.id, charge.id, client);
+        const processing = await paymentRepository.applyProcessing(payment.id, input.payment_method, generatePublicId("att_"), client);
         if (!processing) throw new IllegalTransitionError(`[PAYMENT] is ${payment.status}, can't confirm`);
-        return { payment: processing, charge, resumed: false };
+        return { payment: processing, resumed: false };
       });
 
       const result: AcquirerResult = await authorize({
-        reference: attempt.charge.public_id,
-        amount: attempt.charge.amount,
-        currency: attempt.charge.currency,
-        paymentMethod: attempt.charge.payment_method,
-        forceTimeout: attempt.charge.payment_method === "pm_card_acquirer_timeout" && !attempt.resumed,
+        reference: attempt.attempt_reference!,
+        amount: attempt.amount,
+        currency: attempt.currency,
+        paymentMethod: attempt.payment_method!,
+        forceTimeout: attempt.payment_method === "pm_card_acquirer_timeout" && !resumed,
       });
 
-      const view = await withTransaction(pool, async (client) => {
+      return withTransaction(pool, async (client) => {
         const payment = await lockOrThrow(merchantId, publicId, client);
-        if (payment.status !== "processing") return loadWithCharges(payment, client);
-
-        await chargeRepository.settle(
-          attempt.charge.id,
-          result.outcome === "approved"
-            ? { status: "succeeded", acquirerReference: result.acquirerReference }
-            : {
-                status: "failed",
-                acquirerReference: result.acquirerReference,
-                failureCode: result.failureCode,
-                failureMessage: result.failureMessage,
-              },
-          client,
-        );
+        if (payment.status !== "processing") return payment;
 
         let updated: PaymentRow | null;
         let eventType: "payment.failed" | "payment.succeeded";
@@ -133,37 +93,32 @@ export function createPaymentService(
           updated = await paymentRepository.applyOutcome(
             payment.id,
             ["processing"],
-            { status: "succeeded", amountCaptured: payment.amount },
+            { status: "succeeded", acquirerReference: result.acquirerReference },
             client,
           );
           eventType = "payment.succeeded";
         }
         if (!updated) throw new IllegalTransitionError("[PAYMENT] lost the processing state mid-confirm");
 
-        const loaded = await loadWithCharges(updated, client);
-        await outboxRepository.append(merchantId, eventType, toPaymentView(loaded.payment, loaded.charges), client);
-        return loaded;
+        await outboxRepository.append(merchantId, eventType, toPaymentView(updated), client);
+        return updated;
       });
-
-      return view;
     },
 
-    async cancel(merchantId, publicId, input) {
-      const view = await withTransaction(pool, async (client) => {
+    async cancel(merchantId, publicId) {
+      return withTransaction(pool, async (client) => {
         const payment = await lockOrThrow(merchantId, publicId, client);
         const legalFrom = ["requires_confirmation"];
         if (!legalFrom.includes(payment.status)) {
           throw new IllegalTransitionError(`[PAYMENT] is ${payment.status}, can't cancel`);
         }
 
-        const updated = await paymentRepository.applyCancel(payment.id, legalFrom, input.cancellation_reason ?? null, client);
+        const updated = await paymentRepository.applyCancel(payment.id, legalFrom, client);
         if (!updated) throw new IllegalTransitionError(`[PAYMENT] is ${payment.status}, can't cancel`);
 
-        const loaded = await loadWithCharges(updated, client);
-        await outboxRepository.append(merchantId, "payment.canceled", toPaymentView(loaded.payment, loaded.charges), client);
-        return loaded;
+        await outboxRepository.append(merchantId, "payment.canceled", toPaymentView(updated), client);
+        return updated;
       });
-      return view;
     },
   };
 }

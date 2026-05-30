@@ -21,8 +21,3 @@ export const PAYMENT_METHOD_TOKENS = [
 
 export const ConfirmPaymentSchema = z.object({ payment_method: z.enum(PAYMENT_METHOD_TOKENS) }).strict();
 export type ConfirmPaymentInput = z.infer<typeof ConfirmPaymentSchema>;
-
-export const CancelPaymentSchema = z.object({
-  cancellation_reason: z.enum(["duplicate", "fraudulent", "requested_by_customer", "abandoned"]).optional(),
-});
-export type CancelPaymentInput = z.infer<typeof CancelPaymentSchema>;

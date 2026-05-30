@@ -8,12 +8,11 @@ export interface PaymentRow {
   currency: string;
   status: string;
   capture_method: string;
-  amount_captured: number;
-  amount_refunded: number;
   description: string | null;
   metadata: Record<string, string>;
-  latest_charge_id: number | null;
-  cancellation_reason: string | null;
+  payment_method: string | null;
+  attempt_reference: string | null;
+  acquirer_reference: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -34,15 +33,14 @@ export interface PaymentRepository {
   lockByPublicIdAndMerchantId(publicId: string, merchantId: number, executor: Queryable): Promise<PaymentRow | null>;
   isCurrencyEnabled(code: string): Promise<boolean>;
 
-  applyProcessing(id: number, chargeId: number, executor: Queryable): Promise<PaymentRow | null>;
+  applyProcessing(id: number, paymentMethod: string, attemptReference: string, executor: Queryable): Promise<PaymentRow | null>;
   applyOutcome(
     id: number,
     legalFrom: string[],
-    input: { status: string; amountCaptured?: number },
+    input: { status: string; acquirerReference?: string | null },
     executor: Queryable,
   ): Promise<PaymentRow | null>;
-  applyCancel(id: number, legalFrom: string[], reason: string | null, executor: Queryable): Promise<PaymentRow | null>;
-  applyRefund(id: number, amountRefunded: number, executor: Queryable): Promise<PaymentRow | null>;
+  applyCancel(id: number, legalFrom: string[], executor: Queryable): Promise<PaymentRow | null>;
 }
 
 export function createPaymentRepository(pool: Queryable): PaymentRepository {
@@ -86,11 +84,14 @@ export function createPaymentRepository(pool: Queryable): PaymentRepository {
       return r.rows[0]?.enabled === true;
     },
 
-    async applyProcessing(id, chargeId, executor) {
+    async applyProcessing(id, paymentMethod, attemptReference, executor) {
       const r = await executor.query<PaymentRow>(
-        `UPDATE payments SET status = 'processing', latest_charge_id = $2, updated_at = now()
-          WHERE id = $1 AND status = 'requires_confirmation' RETURNING *`,
-        [id, chargeId],
+        `UPDATE payments
+            SET status = 'processing', payment_method = $2, attempt_reference = $3, acquirer_reference = NULL,
+                updated_at = now()
+          WHERE id = $1 AND status = 'requires_confirmation'
+          RETURNING *`,
+        [id, paymentMethod, attemptReference],
       );
       return r.rows[0] ?? null;
     },
@@ -98,34 +99,20 @@ export function createPaymentRepository(pool: Queryable): PaymentRepository {
     async applyOutcome(id, legalFrom, input, executor) {
       const r = await executor.query<PaymentRow>(
         `UPDATE payments
-            SET status = $3,
-                amount_captured = COALESCE($4, amount_captured),
-                updated_at = now()
+            SET status = $3, acquirer_reference = $4, updated_at = now()
           WHERE id = $1 AND status = ANY($2::text[])
           RETURNING *`,
-        [id, legalFrom, input.status, input.amountCaptured ?? null],
+        [id, legalFrom, input.status, input.acquirerReference ?? null],
       );
       return r.rows[0] ?? null;
     },
 
-    async applyCancel(id, legalFrom, reason, executor) {
+    async applyCancel(id, legalFrom, executor) {
       const r = await executor.query<PaymentRow>(
-        `UPDATE payments
-            SET status = 'canceled', cancellation_reason = $3, updated_at = now()
-          WHERE id = $1 AND status = ANY($2::text[])
-          RETURNING *`,
-        [id, legalFrom, reason],
+        `UPDATE payments SET status = 'canceled', updated_at = now() WHERE id = $1 AND status = ANY($2::text[]) RETURNING *`,
+        [id, legalFrom],
       );
       return r.rows[0] ?? null;
     },
-
-    async applyRefund(id, amountRefunded, executor) {
-      const r = await executor.query<PaymentRow>(
-        `UPDATE payments SET amount_refunded = amount_refunded + $2, updated_at = now() WHERE id = $1 RETURNING *`,
-        [id, amountRefunded],
-      );
-      return r.rows[0] ?? null;
-    },
-
   };
 }

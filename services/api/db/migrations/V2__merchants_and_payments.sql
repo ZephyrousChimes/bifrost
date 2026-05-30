@@ -50,9 +50,6 @@ CREATE TABLE payments (
                      )),
     capture_method   TEXT NOT NULL CHECK (capture_method IN ('automatic', 'manual')),
 
-    amount_captured  BIGINT NOT NULL DEFAULT 0 CHECK (amount_captured >= 0),
-    amount_refunded  BIGINT NOT NULL DEFAULT 0 CHECK (amount_refunded >= 0),
-
     description      TEXT,
     metadata         JSONB NOT NULL DEFAULT '{}',
 

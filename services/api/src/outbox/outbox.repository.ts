@@ -5,8 +5,7 @@ export type EventType =
   | "payment.created"
   | "payment.succeeded"
   | "payment.failed"
-  | "payment.canceled"
-  | "refund.succeeded";
+  | "payment.canceled";
 
 export interface OutboxRow {
   id: number;
@@ -24,9 +23,6 @@ export interface OutboxRow {
 
 export interface OutboxRepository {
   append(merchantId: number, type: EventType, dataObject: unknown, executor: Queryable): Promise<OutboxRow>;
-  list(merchantId: number, limit: number, type?: string): Promise<OutboxRow[]>;
-  findByPublicIdAndMerchantId(publicId: string, merchantId: number): Promise<OutboxRow | null>;
-
   claimDue(limit: number, leaseSeconds: number): Promise<OutboxRow[]>;
   markDelivered(id: number, note?: string): Promise<void>;
   markRetry(id: number, error: string, delaySeconds: number): Promise<void>;
@@ -49,24 +45,6 @@ export function createOutboxRepository(pool: Queryable): OutboxRepository {
         [publicId, merchantId, type, JSON.stringify(event)],
       );
       return r.rows[0];
-    },
-
-    async list(merchantId, limit, type) {
-      const r = await pool.query<OutboxRow>(
-        type
-          ? `SELECT * FROM outbox_events WHERE merchant_id = $1 AND type = $2 ORDER BY id DESC LIMIT $3`
-          : `SELECT * FROM outbox_events WHERE merchant_id = $1 ORDER BY id DESC LIMIT $2`,
-        type ? [merchantId, type, limit] : [merchantId, limit],
-      );
-      return r.rows;
-    },
-
-    async findByPublicIdAndMerchantId(publicId, merchantId) {
-      const r = await pool.query<OutboxRow>(`SELECT * FROM outbox_events WHERE public_id = $1 AND merchant_id = $2`, [
-        publicId,
-        merchantId,
-      ]);
-      return r.rows[0] ?? null;
     },
 
     async claimDue(limit, leaseSeconds) {

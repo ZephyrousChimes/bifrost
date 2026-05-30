@@ -14,9 +14,7 @@ const STRIPE_TEST_METHODS: Record<string, string> = {
 
 export type AcquirerResult =
   | { outcome: "approved"; acquirerReference: string }
-  | { outcome: "declined"; acquirerReference?: string; failureCode: string; failureMessage: string };
-
-const KNOWN_FAILURE_CODES = ["card_declined", "expired_card", "incorrect_cvc", "processing_error"];
+  | { outcome: "declined" };
 
 export async function authorize(input: {
   reference: string;
@@ -34,6 +32,10 @@ export async function authorize(input: {
     "metadata[reference]": input.reference,
   });
 
+  if (input.forceTimeout) {
+    throw new AcquirerTimeoutError("[ACQUIRER] no answer from stripe, outcome unknown");
+  }
+
   let res: Response;
   try {
     res = await fetch(`${env.STRIPE_API_BASE}/v1/payment_intents`, {
@@ -44,7 +46,7 @@ export async function authorize(input: {
         "Idempotency-Key": input.reference,
       },
       body,
-      signal: AbortSignal.timeout(input.forceTimeout ? 1 : env.ACQUIRER_TIMEOUT_MS),
+      signal: AbortSignal.timeout(env.ACQUIRER_TIMEOUT_MS),
     });
   } catch {
     throw new AcquirerTimeoutError("[ACQUIRER] no answer from stripe, outcome unknown");
@@ -52,30 +54,11 @@ export async function authorize(input: {
 
   const json: any = await res.json().catch(() => ({}));
 
-  if (res.ok) {
-    if (json.status === "succeeded") return { outcome: "approved", acquirerReference: json.id };
-    return {
-      outcome: "declined",
-      acquirerReference: json.id,
-      failureCode: "processing_error",
-      failureMessage: `[ACQUIRER] payment ended as '${json.status}'`,
-    };
+  if (res.ok && json.status === "succeeded") {
+    return { outcome: "approved", acquirerReference: json.id };
   }
-
-  if (res.status === 402 && json.error) {
-    const e = json.error;
-    const failureCode =
-      e.decline_code === "insufficient_funds"
-        ? "insufficient_funds"
-        : KNOWN_FAILURE_CODES.includes(e.code)
-          ? e.code
-          : "card_declined";
-    return {
-      outcome: "declined",
-      acquirerReference: e.payment_intent?.id,
-      failureCode,
-      failureMessage: e.message ?? "declined",
-    };
+  if (res.ok || (res.status === 402 && json.error)) {
+    return { outcome: "declined" };
   }
 
   throw new AcquirerTimeoutError(`[ACQUIRER] stripe answered ${res.status}, outcome unknown`);
