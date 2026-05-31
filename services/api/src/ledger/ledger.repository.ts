@@ -12,6 +12,17 @@ export interface Leg {
 }
 
 export async function postLedgerTransaction(executor: Queryable, paymentId: number, legs: Leg[]) {
+  const byCurrency = new Map<string, number>();
+  for (const leg of legs) {
+    const signed = leg.direction === "debit" ? leg.amount : -leg.amount;
+    byCurrency.set(leg.currency, (byCurrency.get(leg.currency) ?? 0) + signed);
+  }
+  for (const [currency, diff] of byCurrency) {
+    if (diff !== 0) {
+      throw new Error(`[LEDGER] transaction is unbalanced in ${currency} (debits - credits = ${diff})`);
+    }
+  }
+
   const txId = randomUUID();
   for (const leg of legs) {
     await executor.query(
@@ -28,12 +39,13 @@ export interface MoneyAmount {
 }
 
 export async function merchantBalance(executor: Queryable, merchantId: number): Promise<MoneyAmount[]> {
-  const r = await executor.query<MoneyAmount>(
-    `SELECT currency, SUM(CASE direction WHEN 'credit' THEN amount ELSE -amount END)::bigint AS amount
+  const r = await executor.query<{ currency: string; amount: string }>(
+    `SELECT currency, SUM(CASE direction WHEN 'credit' THEN amount ELSE -amount END) AS amount
        FROM ledger_entries
       WHERE merchant_id = $1 AND account = 'merchant_balance'
       GROUP BY currency`,
     [merchantId],
   );
-  return r.rows.length > 0 ? r.rows : [{ amount: 0, currency: "INR" }];
+  const rows = r.rows.map((row) => ({ currency: row.currency, amount: Number(row.amount) }));
+  return rows.length > 0 ? rows : [{ amount: 0, currency: "INR" }];
 }
