@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import { Pool } from "pg";
+import { postLedgerTransaction } from "../services/api/src/ledger/ledger.repository";
 
 const API = process.env.API_URL ?? "http://localhost:8080";
 const HOOK_PORT = 9191;
@@ -117,34 +118,38 @@ async function main() {
     console.log("  (skipped: set DATABASE_URL to check the outbox table)");
   }
 
-  step("9. the ledger invariant lives in the database: try to break it");
+  step("9. the ledger invariant is now checked in application code, not the database");
   if (process.env.DATABASE_URL) {
-    const client = await pool.connect();
+    const before = await pool.query("SELECT count(*) FROM ledger_entries");
     let rejected = "";
     try {
-      await client.query("BEGIN");
-      await client.query(
-        "INSERT INTO ledger_entries (tx_id, account, direction, amount, currency) VALUES (gen_random_uuid(), 'acquirer_receivable', 'debit', 100, 'INR')",
-      );
-      await client.query("COMMIT");
+      await postLedgerTransaction(pool, 999999, [
+        { account: "acquirer_receivable", merchantId: null, direction: "debit", amount: 100, currency: "INR" },
+      ]);
     } catch (e: any) {
       rejected = e.message;
-      await client.query("ROLLBACK");
-    } finally {
-      client.release();
     }
-    check("an unbalanced transaction is rejected at COMMIT", rejected.includes("unbalanced"), rejected);
-    let mutated = "";
-    try {
-      await pool.query("UPDATE ledger_entries SET amount = 1");
-    } catch (e: any) {
-      mutated = e.message;
-    }
-    check("UPDATE on the ledger is rejected (append-only)", mutated.includes("append-only"), mutated);
-    const sum = await pool.query(
-      "SELECT COALESCE(SUM(CASE direction WHEN 'debit' THEN amount ELSE -amount END), 0)::bigint AS diff FROM ledger_entries",
+    const after = await pool.query("SELECT count(*) FROM ledger_entries");
+    check(
+      "an unbalanced set of legs throws before any row is written",
+      rejected.includes("unbalanced") && before.rows[0].count === after.rows[0].count,
+      { rejected, before: before.rows[0].count, after: after.rows[0].count },
     );
-    check("across the whole ledger, sum(debits) - sum(credits) == 0", Number(sum.rows[0].diff) === 0, sum.rows[0]);
+
+    const mutateClient = await pool.connect();
+    try {
+      await mutateClient.query("BEGIN");
+      await mutateClient.query("UPDATE ledger_entries SET amount = 1");
+      console.log("        note: that UPDATE just succeeded — append-only is a convention now, not an enforced guarantee");
+      await mutateClient.query("ROLLBACK");
+    } finally {
+      mutateClient.release();
+    }
+
+    const sum = await pool.query<{ amount: string }>(
+      "SELECT SUM(CASE direction WHEN 'debit' THEN amount ELSE -amount END) AS amount FROM ledger_entries",
+    );
+    check("across the whole ledger, sum(debits) - sum(credits) == 0", Number(sum.rows[0].amount) === 0, sum.rows[0]);
   } else {
     console.log("  (skipped: set DATABASE_URL to run the tamper checks)");
   }
