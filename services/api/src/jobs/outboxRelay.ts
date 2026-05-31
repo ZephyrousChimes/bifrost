@@ -14,7 +14,7 @@ export function createOutboxRelay(outbox: OutboxRepository, merchants: MerchantR
         continue;
       }
 
-      const body = JSON.stringify(row.payload);
+      const body = row.payload;
 
       try {
         const res = await fetch(merchant.webhook_url, {

@@ -1,3 +1,4 @@
+import { Pool } from "pg";
 import { Queryable } from "../db/types";
 import { generatePublicId } from "../lib/publicId";
 
@@ -12,7 +13,7 @@ export interface OutboxRow {
   public_id: string;
   merchant_id: number;
   type: string;
-  payload: unknown;
+  payload: string;
   status: "pending" | "delivered" | "failed";
   attempts: number;
   next_attempt_at: Date;
@@ -22,14 +23,14 @@ export interface OutboxRow {
 }
 
 export interface OutboxRepository {
-  append(merchantId: number, type: EventType, dataObject: unknown, executor: Queryable): Promise<OutboxRow>;
+  append(merchantId: number, type: EventType, dataObject: unknown, executor: Queryable): Promise<void>;
   claimDue(limit: number, leaseSeconds: number): Promise<OutboxRow[]>;
   markDelivered(id: number, note?: string): Promise<void>;
   markRetry(id: number, error: string, delaySeconds: number): Promise<void>;
   markFailed(id: number, error: string): Promise<void>;
 }
 
-export function createOutboxRepository(pool: Queryable): OutboxRepository {
+export function createOutboxRepository(pool: Pool): OutboxRepository {
   return {
     async append(merchantId, type, dataObject, executor) {
       const publicId = generatePublicId("evt_");
@@ -40,31 +41,49 @@ export function createOutboxRepository(pool: Queryable): OutboxRepository {
         created_at: new Date().toISOString(),
         data: { object: dataObject },
       };
-      const r = await executor.query<OutboxRow>(
-        `INSERT INTO outbox_events (public_id, merchant_id, type, payload) VALUES ($1, $2, $3, $4) RETURNING *`,
+      await executor.query(
+        `INSERT INTO outbox_events (public_id, merchant_id, type, payload) VALUES ($1, $2, $3, $4)`,
         [publicId, merchantId, type, JSON.stringify(event)],
       );
-      return r.rows[0];
     },
 
     async claimDue(limit, leaseSeconds) {
-      const r = await pool.query<OutboxRow>(
-        `WITH due AS (
-           SELECT id FROM outbox_events
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const due = await client.query<{ id: number }>(
+          `SELECT id FROM outbox_events
             WHERE status = 'pending' AND next_attempt_at <= now()
             ORDER BY id
             LIMIT $1
-            FOR UPDATE SKIP LOCKED
-         )
-         UPDATE outbox_events o
-            SET attempts = o.attempts + 1,
-                next_attempt_at = now() + make_interval(secs => $2)
-           FROM due
-          WHERE o.id = due.id
-         RETURNING o.*`,
-        [limit, leaseSeconds],
-      );
-      return r.rows;
+            FOR UPDATE SKIP LOCKED`,
+          [limit],
+        );
+
+        if (due.rows.length === 0) {
+          await client.query("COMMIT");
+          return [];
+        }
+
+        const ids = due.rows.map((r) => r.id);
+        const nextAttemptAt = new Date(Date.now() + leaseSeconds * 1000);
+        const idPlaceholders = ids.map((_, i) => `$${i + 2}`).join(", ");
+
+        const claimed = await client.query<OutboxRow>(
+          `UPDATE outbox_events SET attempts = attempts + 1, next_attempt_at = $1
+            WHERE id IN (${idPlaceholders})
+          RETURNING *`,
+          [nextAttemptAt, ...ids],
+        );
+
+        await client.query("COMMIT");
+        return claimed.rows;
+      } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+      } finally {
+        client.release();
+      }
     },
 
     async markDelivered(id, note) {
@@ -75,10 +94,12 @@ export function createOutboxRepository(pool: Queryable): OutboxRepository {
     },
 
     async markRetry(id, error, delaySeconds) {
-      await pool.query(
-        `UPDATE outbox_events SET last_error = $2, next_attempt_at = now() + make_interval(secs => $3) WHERE id = $1`,
-        [id, error, delaySeconds],
-      );
+      const nextAttemptAt = new Date(Date.now() + delaySeconds * 1000);
+      await pool.query(`UPDATE outbox_events SET last_error = $2, next_attempt_at = $3 WHERE id = $1`, [
+        id,
+        error,
+        nextAttemptAt,
+      ]);
     },
 
     async markFailed(id, error) {

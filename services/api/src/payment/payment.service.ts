@@ -86,13 +86,13 @@ export function createPaymentService(pool: Pool, paymentRepository: PaymentRepos
         let eventType: "payment.failed" | "payment.succeeded";
 
         if (result.outcome === "declined") {
-          updated = await paymentRepository.applyOutcome(payment.id, ["processing"], { status: "requires_confirmation" }, client);
+          updated = await paymentRepository.applyOutcome(payment.id, "processing", { status: "requires_confirmation" }, client);
           eventType = "payment.failed";
         } else {
           await recordCapture(client, payment, payment.amount);
           updated = await paymentRepository.applyOutcome(
             payment.id,
-            ["processing"],
+            "processing",
             { status: "succeeded", acquirerReference: result.acquirerReference },
             client,
           );
@@ -108,8 +108,8 @@ export function createPaymentService(pool: Pool, paymentRepository: PaymentRepos
     async cancel(merchantId, publicId) {
       return withTransaction(pool, async (client) => {
         const payment = await lockOrThrow(merchantId, publicId, client);
-        const legalFrom = ["requires_confirmation"];
-        if (!legalFrom.includes(payment.status)) {
+        const legalFrom = "requires_confirmation";
+        if (payment.status !== legalFrom) {
           throw new IllegalTransitionError(`[PAYMENT] is ${payment.status}, can't cancel`);
         }
 

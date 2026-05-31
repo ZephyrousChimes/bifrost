@@ -3,7 +3,7 @@ CREATE TABLE outbox_events (
     public_id       TEXT NOT NULL UNIQUE,
     merchant_id     BIGINT NOT NULL REFERENCES merchants(id),
     type            TEXT NOT NULL,
-    payload         JSONB NOT NULL,
+    payload         TEXT NOT NULL,
     status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'delivered', 'failed')),
     attempts        INT NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -12,7 +12,7 @@ CREATE TABLE outbox_events (
     delivered_at    TIMESTAMPTZ
 );
 
-CREATE INDEX outbox_due_idx ON outbox_events (next_attempt_at) WHERE status = 'pending';
+CREATE INDEX outbox_due_idx ON outbox_events (next_attempt_at);
 CREATE INDEX ON outbox_events (merchant_id, id DESC);
 
 ALTER TABLE merchants ADD COLUMN webhook_url TEXT;

@@ -36,17 +36,21 @@ export interface PaymentRepository {
   applyProcessing(id: number, paymentMethod: string, attemptReference: string, executor: Queryable): Promise<PaymentRow | null>;
   applyOutcome(
     id: number,
-    legalFrom: string[],
+    legalFrom: string,
     input: { status: string; acquirerReference?: string | null },
     executor: Queryable,
   ): Promise<PaymentRow | null>;
-  applyCancel(id: number, legalFrom: string[], executor: Queryable): Promise<PaymentRow | null>;
+  applyCancel(id: number, legalFrom: string, executor: Queryable): Promise<PaymentRow | null>;
+}
+
+function parseRow(row: any): PaymentRow {
+  return { ...row, metadata: JSON.parse(row.metadata) };
 }
 
 export function createPaymentRepository(pool: Queryable): PaymentRepository {
   return {
     async insert(input, executor = pool) {
-      const result = await executor.query<PaymentRow>(
+      const result = await executor.query(
         `INSERT INTO payments (public_id, merchant_id, amount, currency, status, capture_method, description, metadata)
          VALUES ($1, $2, $3, $4, 'requires_confirmation', $5, $6, $7)
          RETURNING *`,
@@ -60,23 +64,23 @@ export function createPaymentRepository(pool: Queryable): PaymentRepository {
           JSON.stringify(input.metadata),
         ],
       );
-      return result.rows[0];
+      return parseRow(result.rows[0]);
     },
 
     async findByPublicIdAndMerchantId(publicId, merchantId, executor = pool) {
-      const result = await executor.query<PaymentRow>(
+      const result = await executor.query(
         `SELECT * FROM payments WHERE public_id = $1 AND merchant_id = $2`,
         [publicId, merchantId],
       );
-      return result.rows[0] ?? null;
+      return result.rows[0] ? parseRow(result.rows[0]) : null;
     },
 
     async lockByPublicIdAndMerchantId(publicId, merchantId, executor) {
-      const result = await executor.query<PaymentRow>(
+      const result = await executor.query(
         `SELECT * FROM payments WHERE public_id = $1 AND merchant_id = $2 FOR UPDATE`,
         [publicId, merchantId],
       );
-      return result.rows[0] ?? null;
+      return result.rows[0] ? parseRow(result.rows[0]) : null;
     },
 
     async isCurrencyEnabled(code) {
@@ -85,7 +89,7 @@ export function createPaymentRepository(pool: Queryable): PaymentRepository {
     },
 
     async applyProcessing(id, paymentMethod, attemptReference, executor) {
-      const r = await executor.query<PaymentRow>(
+      const r = await executor.query(
         `UPDATE payments
             SET status = 'processing', payment_method = $2, attempt_reference = $3, acquirer_reference = NULL,
                 updated_at = now()
@@ -93,26 +97,25 @@ export function createPaymentRepository(pool: Queryable): PaymentRepository {
           RETURNING *`,
         [id, paymentMethod, attemptReference],
       );
-      return r.rows[0] ?? null;
+      return r.rows[0] ? parseRow(r.rows[0]) : null;
     },
 
     async applyOutcome(id, legalFrom, input, executor) {
-      const r = await executor.query<PaymentRow>(
-        `UPDATE payments
-            SET status = $3, acquirer_reference = $4, updated_at = now()
-          WHERE id = $1 AND status = ANY($2::text[])
+      const r = await executor.query(
+        `UPDATE payments SET status = $3, acquirer_reference = $4, updated_at = now()
+          WHERE id = $1 AND status = $2
           RETURNING *`,
         [id, legalFrom, input.status, input.acquirerReference ?? null],
       );
-      return r.rows[0] ?? null;
+      return r.rows[0] ? parseRow(r.rows[0]) : null;
     },
 
     async applyCancel(id, legalFrom, executor) {
-      const r = await executor.query<PaymentRow>(
-        `UPDATE payments SET status = 'canceled', updated_at = now() WHERE id = $1 AND status = ANY($2::text[]) RETURNING *`,
+      const r = await executor.query(
+        `UPDATE payments SET status = 'canceled', updated_at = now() WHERE id = $1 AND status = $2 RETURNING *`,
         [id, legalFrom],
       );
-      return r.rows[0] ?? null;
+      return r.rows[0] ? parseRow(r.rows[0]) : null;
     },
   };
 }

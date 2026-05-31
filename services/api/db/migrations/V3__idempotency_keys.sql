@@ -8,7 +8,7 @@ CREATE TABLE idempotency_keys (
     status       TEXT NOT NULL CHECK (status IN ('in_progress', 'completed')),
 
     response_status  SMALLINT,
-    response_body    JSONB,
+    response_body    TEXT,
 
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ NULL

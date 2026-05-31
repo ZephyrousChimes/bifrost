@@ -51,7 +51,7 @@ CREATE TABLE payments (
     capture_method   TEXT NOT NULL CHECK (capture_method IN ('automatic', 'manual')),
 
     description      TEXT,
-    metadata         JSONB NOT NULL DEFAULT '{}',
+    metadata         TEXT NOT NULL DEFAULT '{}',
 
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
