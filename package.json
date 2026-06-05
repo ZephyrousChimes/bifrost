@@ -1,0 +1,12 @@
+{
+  "name": "bifrost-node",
+  "private": true,
+  "workspaces": [
+    "services/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run dev --workspace services/api",
+    "build:api": "npm run build --workspace services/api",
+    "migrate:api": "npm run migrate --workspace services/api"
+  }
+}
