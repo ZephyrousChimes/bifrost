@@ -12,6 +12,7 @@ const EnvSchema = z.object({
 
   PLATFORM_FEE_BPS: z.coerce.number().int().min(0).max(10000).default(290),
   JOB_POLL_MS: z.coerce.number().int().positive().default(2000),
+  STALE_PROCESSING_MS: z.coerce.number().int().positive().default(60000),
 });
 
 export const env = EnvSchema.parse(process.env);
