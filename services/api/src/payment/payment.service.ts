@@ -53,7 +53,6 @@ export function createPaymentService(
         throw new IllegalTransitionError(`[PAYMENT] is ${payment.status}, can't confirm`);
       }
 
-      // resume-only mode (used by the stale-payment job): never start a new charge
       if (!input) return null;
 
       const charge = await chargeRepository.insertPending(

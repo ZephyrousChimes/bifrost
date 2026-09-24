@@ -8,7 +8,6 @@ const MIGRATIONS_DIR = path.join(__dirname, "..", "..", "db", "migrations");
 
 async function migrate() {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
-  // one runner at a time: a second concurrent runner waits here instead of colliding
   const lock = await pool.connect();
   await lock.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_ID]);
   try {
