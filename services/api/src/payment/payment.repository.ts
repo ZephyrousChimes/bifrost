@@ -43,6 +43,7 @@ export interface PaymentRepository {
   ): Promise<PaymentRow | null>;
   applyCancel(id: number, legalFrom: string[], reason: string | null, executor: Queryable): Promise<PaymentRow | null>;
   applyRefund(id: number, amountRefunded: number, executor: Queryable): Promise<PaymentRow | null>;
+  findStaleProcessing(olderThanMs: number, limit: number): Promise<{ public_id: string; merchant_id: number }[]>;
 }
 
 export function createPaymentRepository(pool: Queryable): PaymentRepository {
@@ -117,6 +118,16 @@ export function createPaymentRepository(pool: Queryable): PaymentRepository {
         [id, legalFrom, reason],
       );
       return r.rows[0] ?? null;
+    },
+
+    async findStaleProcessing(olderThanMs, limit) {
+      const r = await pool.query<{ public_id: string; merchant_id: number }>(
+        `SELECT public_id, merchant_id FROM payments
+          WHERE status = 'processing' AND updated_at < now() - ($1::int * interval '1 millisecond')
+          ORDER BY updated_at LIMIT $2`,
+        [olderThanMs, limit],
+      );
+      return r.rows;
     },
 
     async applyRefund(id, amountRefunded, executor) {

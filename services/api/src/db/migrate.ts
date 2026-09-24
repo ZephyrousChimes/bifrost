@@ -3,10 +3,13 @@ import path from "node:path";
 import { Pool } from "pg";
 import { env } from "../config/env";
 
+const MIGRATION_LOCK_ID = 727001;
 const MIGRATIONS_DIR = path.join(__dirname, "..", "..", "db", "migrations");
 
 async function migrate() {
   const pool = new Pool({ connectionString: env.DATABASE_URL });
+  const lock = await pool.connect();
+  await lock.query("SELECT pg_advisory_lock($1)", [MIGRATION_LOCK_ID]);
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -45,6 +48,8 @@ async function migrate() {
       }
     }
   } finally {
+    await lock.query("SELECT pg_advisory_unlock($1)", [MIGRATION_LOCK_ID]);
+    lock.release();
     await pool.end();
   }
 }
